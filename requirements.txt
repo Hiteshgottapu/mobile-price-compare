@@ -1,2 +1,6 @@
-streamlit
-requests
+streamlit>=1.40.0
+requests>=2.31.0
+pandas>=2.0.0
+rapidfuzz>=3.6.0
+python-dotenv>=1.0.0
+sqlite-utils>=3.35
