@@ -1,22 +1,18 @@
 # app.py
 """
-Minimal Streamlit app for Mobile Price Compare using SerpApi .
+Minimal Streamlit app for Mobile Price Compare using SerpApi.
 Self-contained: includes a tiny SerpApi client and a simple SQLite cache.
 Dependencies:
-    pip install streamlit requests pandas rapidfuzz
+    pip install streamlit requests pandas rapidfuzz python-dotenv
 (rapidfuzz is optional — if missing, the app will fall back to a simple exact/substring clusterer)
 
 Usage:
-    1. Set environment variable SERPAPI_KEY to your SerpApi API key.
-       On Windows PowerShell:
-           setx SERPAPI_KEY "your_key_here"
-       On macOS / Linux:
-           export SERPAPI_KEY="your_key_here"
+    1. Put SERPAPI_KEY in your environment or .env
     2. Run:
            streamlit run app.py
 """
-
 import os
+from dotenv import load_dotenv
 import time
 import json
 import sqlite3
@@ -25,6 +21,8 @@ from typing import List, Dict, Any, Optional
 import requests
 import pandas as pd
 import streamlit as st
+from collections import Counter
+import re
 
 # Optional fuzzy library: rapidfuzz
 try:
@@ -33,17 +31,17 @@ try:
 except Exception:
     HAS_RAPIDFUZZ = False
 
+load_dotenv()
 # ---------- Config ----------
 DB_PATH = Path(__file__).parent / "cache.sqlite"
 SERPAPI_URL = "https://serpapi.com/search"
-SERPAPI_KEY = os.getenv("SERPAPI_KEY")  # must be set in environment
+SERPAPI_KEY = os.getenv("SERPAPI_KEY")  # now loaded from .env or environment
 CACHE_TTL = 60 * 60  # 1 hour cache default
 
 st.set_page_config(page_title="Mobile Price Compare", layout="wide")
 st.title("📱 Mobile Price Compare — SerpApi")
+
 # ---------- Custom HTML & CSS ----------
-# Enhanced UI: Modern, clean, with subtle animations and branding
-# Enhanced UI: Modern, clean, with subtle animations and branding
 st.markdown(
     """
     <style>
@@ -137,7 +135,6 @@ st.markdown(
         margin-bottom: 0.8rem;
         box-shadow: 0 1px 6px rgba(30,64,175,0.06);
     }
-    /* Custom badge for branding */
     .mpc-badge {
         display: inline-block;
         background: linear-gradient(90deg, #2563eb 0%, #1e40af 100%);
@@ -156,20 +153,17 @@ st.markdown(
         from { opacity: 0; transform: scale(0.9);}
         to { opacity: 1; transform: scale(1);}
     }
-    /* Add a subtle hover effect to expanders */
     .stExpander {
         transition: box-shadow 0.2s;
     }
     .stExpander:hover {
         box-shadow: 0 2px 12px rgba(30,64,175,0.10);
     }
-    /* Add a floating effect to the search bar */
     .stTextInput {
         box-shadow: 0 2px 10px rgba(30,64,175,0.07);
         border-radius: 14px;
         margin-bottom: 0.5rem;
     }
-    /* Responsive tweaks */
     @media (max-width: 900px) {
         .main .block-container {
             padding: 1.2rem 0.5rem;
@@ -182,7 +176,6 @@ st.markdown(
     """,
     unsafe_allow_html=True
 )
-# Add a subtle badge under the title for branding
 st.markdown('<div class="mpc-badge">Powered by SerpApi & Google Shopping</div>', unsafe_allow_html=True)
 
 # ---------- Simple SQLite cache ----------
@@ -269,19 +262,83 @@ def search_serpapi(query: str, country: str = "in", no_cache: bool = False) -> L
     r.raise_for_status()
     data = r.json()
 
-    # SerpApi returns shopping results commonly under 'shopping_results'
-    offers_raw = data.get("shopping_results") or data.get("shopping_results", []) or []
+    # SerpApi returns shopping results commonly under 'shopping_results' or 'product_results'
+    offers_raw = data.get("shopping_results") or data.get("product_results") or []
+
+    # Debug: print source and link for each offer before filtering
+    print("--- Raw offers from SerpApi ---")
+    for it in offers_raw:
+        title = it.get("title") or it.get("name") or it.get("product_title") or it.get("title_raw") or ""
+        source_val = ""
+        for k in ("source", "merchant", "store", "store_name", "seller", "marketplace"):
+            v = it.get(k)
+            if v:
+                source_val = str(v)
+                break
+        link = it.get("link") or it.get("product_link") or it.get("click") or ""
+        print(f"Source: {source_val}, Link: {link}, Title: {title}")
+    BLOCKED_DOMAINS = ["addmecart", "meesho"]
+    EXCLUDE_KEYWORDS = [
+        "case", "cover", "glass", "protector", "tempered", "screen guard", "back cover", "flip cover",
+        "bumper", "pouch", "stand", "holder", "skin", "matte", "film", "combo", "charger", "adapter",
+        "cable", "earphone", "headphone", "wireless", "bluetooth", "speaker", "smartwatch", "band",
+        "strap", "mount", "dock", "cleaner", "lens", "stylus", "ring", "tripod", "selfie", "car mount",
+        "car charger", "rent", "rental", "for rent", "maccafe", "back cover", "panel"
+    ]
+
+    def is_accessory(title: str) -> bool:
+        t = title.lower() if title else ""
+        return any(kw in t for kw in EXCLUDE_KEYWORDS)
+
+    def is_blocked_website(source: str, link: str) -> bool:
+        s = source.lower() if source else ""
+        l = link.lower() if link else ""
+        return any(b in s or b in l for b in BLOCKED_DOMAINS)
+
+    def title_matches_query(title: str, query: str) -> bool:
+        if not query or not title:
+            return True
+        q_tokens = [t for t in normalize_text(query).split() if t]
+        title_norm = normalize_text(title)
+        return all(tok in title_norm for tok in q_tokens)
+
     offers = []
     for it in offers_raw:
-        # different fields may exist; be tolerant
-        title = it.get("title") or it.get("name") or it.get("product_title") or ""
-        source = it.get("source") or it.get("merchant") or it.get("store") or ""
-        # price sometimes as dict 'price' or 'extracted_price' or string 'price'
-        price = it.get("price") or it.get("extracted_price") or it.get("price_string") or it.get("displayed_price") or ""
+        title = it.get("title") or it.get("name") or it.get("product_title") or it.get("title_raw") or ""
+        source_val = ""
+        for k in ("source", "merchant", "store", "store_name", "seller", "marketplace"):
+            v = it.get(k)
+            if v:
+                source_val = str(v)
+                break
+        source = source_val.lower().strip() if source_val else ""
         link = it.get("link") or it.get("product_link") or it.get("click") or ""
+
+        exclusion_reason = None
+        if not title:
+            exclusion_reason = "No title"
+        elif is_accessory(title):
+            exclusion_reason = "Accessory/rental detected"
+        elif is_blocked_website(source, link):
+            exclusion_reason = f"Blocked domain: {source}"
+        elif not title_matches_query(title, query):
+            exclusion_reason = "Title does not match query"
+
+        if exclusion_reason:
+            # Only log for Amazon/Flipkart
+            if "amazon" in source or "flipkart" in source:
+                print(f"EXCLUDED [{source}] - {exclusion_reason} | Title: {title} | Link: {link}")
+            continue
+
+        price = it.get("price") or it.get("extracted_price") or it.get("price_string") or it.get("displayed_price") or ""
+        if not price:
+            raw = it.get("raw") or {}
+            if isinstance(raw, dict):
+                price = raw.get("price") or raw.get("price_string") or raw.get("extracted_price") or price
+
         offers.append({
             "title": title,
-            "source": source,
+            "source": source or None,
             "price": price,
             "link": link,
             "raw": it
@@ -296,7 +353,7 @@ def normalize_text(s: str) -> str:
     if not s:
         return ""
     s = s.lower()
-    # remove punctuation except + and space & numbers
+    # remove punctuation except + and space & numbers -> replace punctuation by space
     keep = []
     for ch in s:
         if ch.isalnum() or ch.isspace() or ch == "+":
@@ -312,7 +369,6 @@ def price_to_float(p) -> Optional[float]:
         return None
     s = str(p)
     # try to extract digits and decimals
-    import re
     m = re.search(r"[\d\.,]+", s)
     if not m:
         return None
@@ -321,6 +377,21 @@ def price_to_float(p) -> Optional[float]:
         return float(num)
     except Exception:
         return None
+
+def choose_canonical_title(titles: List[str]) -> str:
+    """
+    Choose a canonical title for a cluster:
+    prefer the most common normalized title, else shortest descriptive title.
+    """
+    if not titles:
+        return ""
+    # count normalized
+    norm_map = {t: normalize_text(t) for t in titles}
+    counts = Counter(norm_map.values())
+    most_common_norm, _ = counts.most_common(1)[0]
+    # pick the shortest original title that has that normalized form (for readability)
+    candidates = [t for t, n in norm_map.items() if n == most_common_norm]
+    return min(candidates, key=len) if candidates else titles[0]
 
 def cluster_offers(offers: List[Dict[str, Any]], threshold: int = 85) -> List[Dict[str, Any]]:
     """
@@ -352,48 +423,151 @@ def cluster_offers(offers: List[Dict[str, Any]], threshold: int = 85) -> List[Di
         if not placed:
             clusters.append({"canonical": title, "canonical_norm": norm, "items": [off]})
 
-    # compute min price per cluster
+    # compute min price per cluster and pick a better canonical
     out = []
     for c in clusters:
         min_p = None
         min_src = None
         min_link = None
         rows = []
+        titles_for_canonical = []
         for it in c["items"]:
             pr = price_to_float(it.get("price"))
-            rows.append({"title": it.get("title"), "source": it.get("source"), "price": pr, "link": it.get("link")})
+            rows.append({
+                "title": it.get("title"),
+                "source": it.get("source"),
+                "price": pr,
+                "link": it.get("link")
+            })
+            titles_for_canonical.append(it.get("title"))
             if pr is not None and (min_p is None or pr < min_p):
                 min_p = pr
                 min_src = it.get("source")
                 min_link = it.get("link")
+        canonical_title = choose_canonical_title(titles_for_canonical)
         out.append({
-            "canonical": c["canonical"],
-            "canonical_norm": c["canonical_norm"],
+            "canonical": canonical_title,
+            "canonical_norm": normalize_text(canonical_title),
             "min_price": min_p,
             "min_source": min_src,
             "min_link": min_link,
             "items": rows
         })
-    # sort with available prices first
+    # sort with available prices first, lowest first
     out.sort(key=lambda x: (x["min_price"] is None, x["min_price"] if x["min_price"] is not None else float("inf")))
     return out
 
 # ---------- Streamlit UI ----------
+st.sidebar.header("🔎 Filter Products")
+query = st.sidebar.text_input("Mobile model (e.g., iPhone 14 128GB)")
+live = st.sidebar.checkbox("Live (no-cache)", value=False)
+search_btn = st.sidebar.button("Search")
 
-st.markdown("Enter a mobile model below and click **Search**. Results come from Google Shopping via SerpApi.")
-col1, col2, col3 = st.columns([6, 2, 2])
-
-with col1:
-    query = st.text_input("Mobile model (e.g., iPhone 14 128GB)")
-
-with col2:
-    live = st.checkbox("Live (no-cache)", value=False)
-
-with col3:
-    search_btn = st.button("Search")
+price_min, price_max = st.sidebar.slider("Price Range (₹)", 0, 200000, (0, 200000), step=1000)
 
 if not SERPAPI_KEY:
-    pass
+    st.warning("Missing SERPAPI_KEY. Set it in your environment or .env file.")
+
+def extract_storage_ram(title: str):
+    import re
+    storage = None
+    ram = None
+    storage_matches = re.findall(r'(\d+)\s*(gb|tb)', title.lower())
+    for val, unit in storage_matches:
+        v = int(val)
+        if unit == 'tb':
+            v *= 1024
+        if storage is None or v > storage:
+            storage = v
+    ram_matches = re.findall(r'(\d+)\s*(gb)\s*(ram)?', title.lower())
+    for val, unit, _ in ram_matches:
+        v = int(val)
+        if ram is None or v > ram:
+            ram = v
+    return storage, ram
+
+def passes_filters(offer):
+    price = offer.get("price")
+    try:
+        price_val = float(str(price).replace(",", "").replace("₹", "")) if price else None
+    except Exception:
+        price_val = None
+    if price_val is not None and (price_val < price_min or price_val > price_max):
+        return False
+    storage, ram = extract_storage_ram(offer.get("title", ""))
+    return True
+
+if search_btn and query:
+    st.info(f"Searching for: **{query}** (live={live})")
+    try:
+        offers = search_serpapi(query, country="in", no_cache=live)
+        def price_to_float(price):
+            try:
+                return float(str(price).replace(",", "").replace("₹", ""))
+            except Exception:
+                return float('inf')
+        filtered_offers = [o for o in offers if passes_filters(o)]
+        filtered_offers.sort(key=lambda o: price_to_float(o.get('price')))
+        if not filtered_offers:
+            st.warning("No products found matching your filters.")
+        else:
+            st.markdown("""
+            <style>
+            .product-card {
+                border-radius: 14px;
+                padding: 1.2rem;
+                margin-bottom: 1.1rem;
+                min-height: 350px;
+                max-height: 350px;
+                box-shadow: 0 2px 10px rgba(30,64,175,0.07);
+                transition: box-shadow 0.2s, transform 0.2s;
+                border: 1.5px solid #e0e7ef;
+                display: flex;
+                flex-direction: column;
+                justify-content: space-between;
+            }
+            .product-card:hover {
+                box-shadow: 0 6px 24px rgba(30,64,175,0.13);
+                transform: translateY(-2px) scale(1.02);
+                border-color: #2563eb;
+            }
+            .view-btn {
+                color: #fff;
+                background: linear-gradient(90deg, #22c55e 0%, #1e40af 100%);
+                padding: 0.7rem 1.6rem;
+                border-radius: 10px;
+                text-decoration: none;
+                font-weight: 700;
+                font-size: 1.09rem;
+                margin-top: 0.7rem;
+                display: inline-block;
+                box-shadow: 0 2px 10px rgba(30,64,175,0.10);
+                transition: background 0.2s, transform 0.1s, box-shadow 0.2s;
+            }
+            .view-btn:hover {
+                background: linear-gradient(90deg, #1e40af 0%, #2563eb 100%);
+                transform: scale(1.07);
+                box-shadow: 0 4px 16px rgba(30,64,175,0.13);
+            }
+            </style>
+            """, unsafe_allow_html=True)
+            st.markdown("## 🛒 Products Found")
+            cols = st.columns(3)
+            for idx, offer in enumerate(filtered_offers):
+                with cols[idx % 3]:
+                    st.markdown(f"""
+                    <div class='product-card'>
+                        <b style='font-size:1.15rem;color:#1a365d'>{offer.get('title')}</b><br>
+                        <span style='color:#2563eb;font-weight:600'>Price:</span> <b style='color:#1e40af;font-size:1.18rem'>{offer.get('price','-')}</b><br>
+                        <a href='{offer.get('link')}' target='_blank' class='view-btn'>View Product</a>
+                    </div>
+                    """, unsafe_allow_html=True)
+    except Exception as e:
+        st.error(f"Error: {e}")
+
+# Show notice if API key missing
+if not SERPAPI_KEY:
+    st.warning("SERPAPI_KEY not set. Live searches will not run. Set the SERPAPI_KEY environment variable or create a .env file.")
 
 if search_btn and query:
     st.info(f"Searching for: **{query}** (live={live})")
@@ -409,41 +583,20 @@ if search_btn and query:
             st.warning("No offers returned by SerpApi for this query.")
         else:
             clusters = cluster_offers(offers)
-            # show top (best) cluster and lowest price
-            top = clusters[0]
-            st.markdown("### 🏆 Best match & lowest price (from clusters)")
-            if top.get("min_price") is not None:
-                st.success(f"Cheapest: **₹{top['min_price']:.2f}** on **{top.get('min_source')}**")
-                if top.get("min_link"):
-                    st.markdown(f"[Open product link]({top.get('min_link')})")
+            if not clusters:
+                st.warning("No clusters formed from offers.")
             else:
-                st.info("Found offers but none had a parseable price.")
+                # show top (best) cluster and lowest price
+                top = clusters[0]
+                st.markdown("### 🏆 Best match & lowest price (from clusters)")
+                if top.get("min_price") is not None:
+                    st.success(f"Cheapest: **₹{top['min_price']:.2f}** on **{top.get('min_source') or 'unknown'}**")
+                    if top.get("min_link"):
+                        st.markdown(f"[Open product link]({top.get('min_link')})")
+                else:
+                    st.info("Found offers but none had a parseable price.")
 
-            st.markdown("---")
-            st.markdown("#### All clusters (click to expand)")
-            for c in clusters[:30]:
-                header = f"{c['canonical']} — Min: {'₹{:.2f}'.format(c['min_price']) if c['min_price'] is not None else 'N/A'}"
-                with st.expander(header):
-                    df = pd.DataFrame(c["items"])
-                    # include clickable links (markdown) if present
-                    if not df.empty:
-                        # ensure columns
-                        if "price" in df.columns:
-                            df["price_display"] = df["price"].apply(lambda v: f"₹{v:.2f}" if v is not None else "N/A")
-                        display_cols = [c for c in ["title", "source", "price_display", "link"] if c in df.columns]
-                        # Use st.table / st.dataframe for clean view, and also show direct clickable links below
-                        st.dataframe(df[display_cols] if display_cols else df, use_container_width=True)
-                        # Provide clickable links as separate list for easier click
-                        for idx, row in df.iterrows():
-                            txt = row.get("title") or "-"
-                            src = row.get("source") or "-"
-                            link = row.get("link") or ""
-                            if link:
-                                st.markdown(f"- **{src}** — [{txt}]({link}) — {row.get('price_display','')}")
-                            else:
-                                st.markdown(f"- **{src}** — {txt} — {row.get('price_display','')}")
-                    else:
-                        st.write("No items in this cluster.")
+                        # All clusters section and related code removed
 
     except requests.HTTPError as e:
         st.error(f"HTTP error while calling SerpApi: {e}")
